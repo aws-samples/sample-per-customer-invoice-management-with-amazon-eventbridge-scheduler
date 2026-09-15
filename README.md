@@ -21,7 +21,7 @@ a payment arrives, a handler deletes any outstanding reminder schedules.
 | Component | Purpose |
 |-----------|---------|
 | Amazon EventBridge Scheduler | Per-customer recurring invoice schedules and one-time reminders |
-| AWS Lambda | 5 functions: signup, generate invoice, send reminder, payment received, reconciliation |
+| AWS Lambda | 4 functions: signup, generate invoice, send reminder, payment received |
 | Amazon DynamoDB | 3 tables (customers, invoices, reminder log) with point-in-time recovery and CMK encryption |
 | Amazon SES | Sends reminder email (optional; log-only mode without a verified sender) |
 | Amazon SQS | Dead-letter queue for failed schedule invocations, encrypted with the same CMK |
@@ -92,7 +92,6 @@ get_output() {
 SIGNUP_FN=$(get_output SignupFunctionName)
 GENERATE_FN=$(get_output GenerateInvoiceFunctionName)
 PAYMENT_FN=$(get_output PaymentReceivedFunctionName)
-RECON_FN=$(get_output ReconciliationFunctionName)
 SEND_FN=$(aws cloudformation describe-stack-resource --stack-name "$STACK" \
   --logical-resource-id SendReminderFunction \
   --query 'StackResourceDetail.PhysicalResourceId' --output text)
@@ -184,19 +183,7 @@ aws scheduler list-schedules --group-name "$REMINDER_GROUP"
 
 Should return `"Schedules": []`.
 
-### 8. Run reconciliation
-
-```bash
-aws lambda invoke \
-  --function-name "$RECON_FN" \
-  --payload '{}' \
-  --cli-binary-format raw-in-base64-out \
-  reconciliation-output.json && cat reconciliation-output.json
-```
-
-Expected: `{"missing_repaired":0,"orphaned_removed":0,"total_active_customers":1,"total_schedules":1}`.
-
-### 9. (Optional) Manually test the reminder sender
+### 8. (Optional) Manually test the reminder sender
 
 Use this if you deployed with `SenderEmail` and want to confirm the email path.
 Since the invoice from step 3 is now paid, generate a fresh unpaid invoice for a
@@ -227,7 +214,7 @@ Expected in log-only mode (no `SenderEmail`): `{"action":"reminder_sent","type":
 
 Expected with a verified sender: `{"action":"reminder_sent","type":"7day","delivery":"emailed"}` and an email in the recipient's inbox.
 
-### 10. (Optional) Inspect the data
+### 9. (Optional) Inspect the data
 
 ```bash
 CUSTOMER_TABLE=$(get_output CustomerTableName)
@@ -267,8 +254,7 @@ billing-scheduler-sam/
 │   ├── signup/app.py                 # Direct invoke — create customer + billing schedule
 │   ├── generate_invoice/app.py       # Scheduler target — generate invoice + reminders
 │   ├── send_reminder/app.py          # Scheduler target — send payment reminder
-│   ├── payment_received/app.py       # EventBridge or direct invoke — mark paid + cancel reminders
-│   └── reconciliation/app.py         # Daily audit — detect/repair schedule drift
+│   └── payment_received/app.py       # EventBridge or direct invoke — mark paid + cancel reminders
 └── layers/
     └── shared/
         ├── requirements.txt          # Layer dependencies (none; boto3 is in the runtime)
