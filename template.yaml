@@ -1,0 +1,470 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Per-Customer Invoice Generation and Payment Reminders with Amazon EventBridge Scheduler.
+  Deploys DynamoDB tables, Lambda functions, EventBridge Scheduler groups, an SQS
+  dead-letter queue, and an API for signup and payment webhooks.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: billing
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+    Description: >
+      Prefix for resource names (schedule groups, DynamoDB tables, DLQ). Lets you
+      deploy multiple independent stacks in the same account and Region.
+  SenderEmail:
+    Type: String
+    Default: ''
+    Description: >
+      A verified Amazon SES sender identity (email address) used to send reminder
+      email. Leave blank to run in log-only mode (reminders are logged, not emailed).
+
+Conditions:
+  HasSenderEmail: !Not [!Equals [!Ref SenderEmail, '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        INVOICE_GROUP: !Sub "${ResourcePrefix}-invoices"
+        REMINDER_GROUP: !Sub "${ResourcePrefix}-reminders"
+        INVOICE_TABLE: !Ref InvoiceTable
+        CUSTOMER_TABLE: !Ref CustomerTable
+        REMINDER_LOG_TABLE: !Ref ReminderLogTable
+        DLQ_ARN: !GetAtt BillingDLQ.Arn
+        SENDER_EMAIL: !Ref SenderEmail
+
+Resources:
+  # ============================================================
+  # KMS customer-managed key
+  # Encrypts the DynamoDB tables and the SQS dead-letter queue at rest. One key
+  # is shared to keep the sample simple. Enable key rotation for best practice.
+  # ============================================================
+  BillingKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "Customer-managed KMS key for ${AWS::StackName} (DynamoDB tables and SQS DLQ)"
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: '*'
+
+  BillingKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ResourcePrefix}-key"
+      TargetKeyId: !Ref BillingKey
+
+  # ============================================================
+  # Schedule Groups
+  # ============================================================
+  InvoiceScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub "${ResourcePrefix}-invoices"
+      Tags:
+        - Key: application
+          Value: !Ref ResourcePrefix
+        - Key: cost-center
+          Value: platform
+
+  ReminderScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub "${ResourcePrefix}-reminders"
+      Tags:
+        - Key: application
+          Value: !Ref ResourcePrefix
+        - Key: cost-center
+          Value: platform
+
+  # ============================================================
+  # DynamoDB Tables
+  # ============================================================
+  CustomerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref BillingKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+
+  InvoiceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref BillingKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: invoice_id
+          AttributeType: S
+        - AttributeName: idempotency_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: invoice_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: idempotency-index
+          KeySchema:
+            - AttributeName: idempotency_key
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  ReminderLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref BillingKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: idempotency_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotency_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ============================================================
+  # SQS Dead-Letter Queue
+  # ============================================================
+  BillingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref BillingKey
+      KmsDataKeyReusePeriodSeconds: 300
+
+  # ============================================================
+  # Lambda Layer (shared config)
+  # ============================================================
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${ResourcePrefix}-shared"
+      ContentUri: layers/shared/
+      CompatibleRuntimes:
+        - python3.12
+
+  # ============================================================
+  # IAM Roles for EventBridge Scheduler
+  # These roles let Scheduler invoke the Lambda targets. They are scoped to the
+  # specific function ARNs via !GetAtt so no function name needs to be hardcoded.
+  # ============================================================
+  SchedulerInvoiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeGenerateInvoice
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt GenerateInvoiceFunction.Arn
+              # Allow writing failed invocations to the KMS-encrypted DLQ
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource: !GetAtt BillingKey.Arn
+
+  SchedulerReminderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeSendReminder
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt SendReminderFunction.Arn
+              # Allow writing failed invocations to the KMS-encrypted DLQ
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource: !GetAtt BillingKey.Arn
+
+  # ============================================================
+  # Lambda Functions
+  # ============================================================
+  SignupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: functions/signup/
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          GENERATE_INVOICE_FUNCTION_ARN: !GetAtt GenerateInvoiceFunction.Arn
+          SCHEDULER_INVOICE_ROLE_ARN: !GetAtt SchedulerInvoiceRole.Arn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CustomerTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - scheduler:CreateSchedule
+                - scheduler:UpdateSchedule
+                - scheduler:GetSchedule
+              Resource: !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ResourcePrefix}-invoices/*"
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource: !GetAtt SchedulerInvoiceRole.Arn
+            # Access the CMK that encrypts the DynamoDB tables
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:ReEncrypt*
+                - kms:GenerateDataKey*
+                - kms:DescribeKey
+              Resource: !GetAtt BillingKey.Arn
+
+  GenerateInvoiceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: functions/generate_invoice/
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          SEND_REMINDER_FUNCTION_ARN: !GetAtt SendReminderFunction.Arn
+          SCHEDULER_REMINDER_ROLE_ARN: !GetAtt SchedulerReminderRole.Arn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref InvoiceTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CustomerTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - scheduler:CreateSchedule
+                - scheduler:UpdateSchedule
+              Resource: !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ResourcePrefix}-reminders/*"
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource: !GetAtt SchedulerReminderRole.Arn
+            # Access the CMK that encrypts the DynamoDB tables
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:ReEncrypt*
+                - kms:GenerateDataKey*
+                - kms:DescribeKey
+              Resource: !GetAtt BillingKey.Arn
+
+  SendReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: functions/send_reminder/
+      Layers:
+        - !Ref SharedLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref InvoiceTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReminderLogTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref CustomerTable
+        - Statement:
+            # Access the CMK that encrypts the DynamoDB tables
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:ReEncrypt*
+                - kms:GenerateDataKey*
+                - kms:DescribeKey
+              Resource: !GetAtt BillingKey.Arn
+        - !If
+          - HasSenderEmail
+          - Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    ses:FromAddress: !Ref SenderEmail
+          - !Ref AWS::NoValue
+
+  PaymentReceivedFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: functions/payment_received/
+      Layers:
+        - !Ref SharedLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref InvoiceTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - scheduler:DeleteSchedule
+              Resource: !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ResourcePrefix}-reminders/*"
+            # Access the CMK that encrypts the DynamoDB tables
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:ReEncrypt*
+                - kms:GenerateDataKey*
+                - kms:DescribeKey
+              Resource: !GetAtt BillingKey.Arn
+
+  ReconciliationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: functions/reconciliation/
+      Timeout: 300
+      Layers:
+        - !Ref SharedLayer
+      Environment:
+        Variables:
+          GENERATE_INVOICE_FUNCTION_ARN: !GetAtt GenerateInvoiceFunction.Arn
+          SCHEDULER_INVOICE_ROLE_ARN: !GetAtt SchedulerInvoiceRole.Arn
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CustomerTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - scheduler:ListSchedules
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - scheduler:CreateSchedule
+                - scheduler:UpdateSchedule
+                - scheduler:DeleteSchedule
+                - scheduler:GetSchedule
+              Resource:
+                - !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ResourcePrefix}-invoices/*"
+            - Effect: Allow
+              Action:
+                - scheduler:GetScheduleGroup
+              Resource:
+                - !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/${ResourcePrefix}-invoices"
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource: !GetAtt SchedulerInvoiceRole.Arn
+            # Access the CMK that encrypts the DynamoDB tables
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:ReEncrypt*
+                - kms:GenerateDataKey*
+                - kms:DescribeKey
+              Resource: !GetAtt BillingKey.Arn
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  InvoiceScheduleGroupName:
+    Description: Schedule group for recurring invoices
+    Value: !Ref InvoiceScheduleGroup
+
+  ReminderScheduleGroupName:
+    Description: Schedule group for payment reminders
+    Value: !Ref ReminderScheduleGroup
+
+  DLQUrl:
+    Description: Dead-letter queue URL for failed schedule invocations
+    Value: !Ref BillingDLQ
+
+  CustomerTableName:
+    Description: DynamoDB table storing customer records
+    Value: !Ref CustomerTable
+
+  InvoiceTableName:
+    Description: DynamoDB table storing invoices
+    Value: !Ref InvoiceTable
+
+  SignupFunctionName:
+    Description: Lambda function that creates a customer and their billing schedule
+    Value: !Ref SignupFunction
+
+  PaymentReceivedFunctionName:
+    Description: Lambda function that marks an invoice paid and cancels reminders
+    Value: !Ref PaymentReceivedFunction
+
+  GenerateInvoiceFunctionName:
+    Description: Lambda function invoked by Scheduler to generate an invoice
+    Value: !Ref GenerateInvoiceFunction
+
+  ReconciliationFunctionName:
+    Description: Lambda function that reconciles customers with schedules (run daily)
+    Value: !Ref ReconciliationFunction
+
+  KmsKeyId:
+    Description: Customer-managed KMS key ID encrypting the DynamoDB tables and SQS DLQ
+    Value: !Ref BillingKey
+
+  KmsKeyArn:
+    Description: Customer-managed KMS key ARN
+    Value: !GetAtt BillingKey.Arn

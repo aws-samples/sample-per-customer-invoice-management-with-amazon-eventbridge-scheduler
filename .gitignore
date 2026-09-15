@@ -1,0 +1,20 @@
+# SAM build artifacts
+.aws-sam/
+
+# Local test output
+*-output.json
+*-output-*.json
+output.json
+reconciliation-output.json
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

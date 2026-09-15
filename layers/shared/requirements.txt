@@ -1,0 +1,2 @@
+# The shared layer has no third-party dependencies.
+# boto3 and botocore are provided by the AWS Lambda Python runtime.

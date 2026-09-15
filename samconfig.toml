@@ -1,0 +1,17 @@
+# SAM CLI configuration file
+# More information at: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-config.html
+#
+# On first deploy, run `sam deploy --guided` to set the stack name, Region, and
+# parameters (ResourcePrefix and SenderEmail) and save them here.
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "billing-scheduler"
+resolve_s3 = true
+s3_prefix = "billing-scheduler"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+image_repositories = []
+# Uncomment and set to send real email (identity must be verified in Amazon SES):
+# parameter_overrides = "ResourcePrefix=billing SenderEmail=billing@example.com"
