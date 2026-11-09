@@ -1,4 +1,4 @@
-# Per-customer invoice generation and payment reminders with Amazon EventBridge Scheduler
+# Per-customer invoice management (generation and payment reminders) with Amazon EventBridge Scheduler
 
 This is the companion code for the AWS Compute Blog post *Per-customer billing with
 Amazon EventBridge Scheduler*. It shows how to use [Amazon EventBridge Scheduler](https://aws.amazon.com/eventbridge/scheduler/)
